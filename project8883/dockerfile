@@ -1,0 +1,12 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY mqtt_rule_detect_daemon.py .
+
+RUN pip install --no-cache-dir \
+    pandas==2.2.0 \
+    influxdb-client==1.41.0 \
+    yagmail==0.15.293
+
+CMD ["python", "mqtt_rule_detect_daemon.py"]

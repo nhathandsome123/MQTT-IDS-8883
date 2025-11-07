@@ -1,0 +1,14 @@
+# Sử dụng image Python nhẹ
+FROM python:3.11-slim
+
+# Đặt thư mục làm việc
+WORKDIR /app
+
+# Sao chép script forwarder vào container
+COPY mqtt_eve_forwarder4.py .
+
+# Cài đặt thư viện cần thiết (chỉ influxdb-client)
+RUN pip install --no-cache-dir influxdb-client
+
+# Lệnh mặc định chạy khi container khởi động
+CMD ["python", "mqtt_eve_forwarder4.py"]
