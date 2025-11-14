@@ -2,8 +2,8 @@
 import json
 import time
 import os
-import re  # For clean_payload_for_json
-from datetime import datetime, timedelta
+import re
+from datetime import datetime
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
@@ -12,103 +12,111 @@ EVE_DIR = os.getenv("EVE_DIR", "/var/log/suricata")
 INFLUX_URL = os.getenv("INFLUX_URL", "http://influxdb:8086")
 INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "iot-admin-token-123")
 INFLUX_ORG = os.getenv("INFLUX_ORG", "iot-org")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "iot-data") # Dùng tên bucket từ docker-compose
+INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "iot-data")
 
-# Cache: (src_ip, src_port) -> (client_id, last_seen)
-client_map = {}
-CACHE_TTL = 86400  # 24 hours
+# Cache: flow_id -> client_id
+client_map = {} 
+PAYLOAD_LIMIT = int(os.getenv("PAYLOAD_LIMIT", "1024"))
 
-PAYLOAD_LIMIT = int(os.getenv("PAYLOAD_LIMIT", "1024")) # Lấy từ env
-
-# Danh sách các trường mong muốn (đã đầy đủ)
+# Danh sách các trường mong muốn
 MQTT_FIELDS_TOP = [
     "dup", "message_id", "password", "protocol_string", "protocol_version",
     "qos", "retain", "return_code", "session_present", "topic", "username"
 ]
 MQTT_FIELDS_JSON = ["topics", "qos_granted", "reason_codes"]
-MQTT_FIELDS_FLAGS = ["clean_session", "password", "username", "will", "will_retain"]
-
+MQTT_FIELDS_FLAGS = ["clean_session", "password", "retain", "will", "will_qos", "will_retain"]
 
 def get_latest_eve_file(directory):
-    """Tìm file eve.json mới nhất (không nén) trong thư mục."""
-    files = [f for f in os.listdir(directory) if f.startswith("eve.json") and not f.endswith(".gz")]
-    if not files:
+    """Tìm file eve.json mới nhất trong thư mục."""
+    try:
+        files = [f for f in os.listdir(directory) if f.startswith("eve") and f.endswith(".json")]
+        if not files:
+            print(f"[ERROR] Không tìm thấy file eve.json nào trong {directory}")
+            return None
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(directory, x)), reverse=True)
+        return os.path.join(directory, files[0])
+    except FileNotFoundError:
+        print(f"[ERROR] Thư mục không tồn tại: {directory}")
         return None
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(directory, x)), reverse=True)
-    return os.path.join(directory, files[0])
-
+    except Exception as e:
+        print(f"[ERROR] Lỗi khi tìm file EVE: {e}")
+        return None
 
 def tail_f(directory):
-    """Theo dõi file eve.json, xử lý việc file xoay vòng (log rotation)."""
-    current_file = get_latest_eve_file(directory)
-    if not current_file:
-        print(f"No eve.json found in {directory}, retrying...")
-        while not current_file:
-            time.sleep(5)
-            current_file = get_latest_eve_file(directory)
-    print(f"Tailing: {current_file}")
-
+    """Theo dõi file EVE mới nhất."""
+    current_file_path = None
+    file = None
+    
     while True:
-        with open(current_file, "r") as f:
-            f.seek(0, 2)
-            while True:
-                line = f.readline()
-                if not line:
-                    new_file = get_latest_eve_file(directory)
-                    if new_file and new_file != current_file:
-                        print(f"File rotated -> {new_file}")
-                        current_file = new_file
-                        break
-                    time.sleep(0.1)
-                    continue
-                yield line
+        latest_file_path = get_latest_eve_file(directory)
+        
+        if not latest_file_path:
+            print(f"[WARN] Đang chờ file EVE xuất hiện trong {directory}...")
+            time.sleep(10)
+            continue
+            
+        if latest_file_path != current_file_path:
+            if file:
+                file.close()
+            try:
+                file = open(latest_file_path, "r")
+                current_file_path = latest_file_path
+                print(f"[INFO] Đang theo dõi file: {current_file_path}")
+                file.seek(0, 2) 
+            except Exception as e:
+                print(f"[ERROR] Không thể mở file {latest_file_path}: {e}")
+                file = None
+                current_file_path = None
+                time.sleep(10)
+                continue
 
-
-def cleanup_client_map():
-    """Xóa các client_id cũ khỏi cache."""
-    now = datetime.utcnow()
-    expired = [k for k, (_, t) in client_map.items() if (now - t).total_seconds() > CACHE_TTL]
-    for k in expired:
-        del client_map[k]
-    if expired:
-        print(f"[CLEANUP] Removed {len(expired)} expired clients")
+        line = file.readline()
+        if not line:
+            # Xử lý logrotate
+            try:
+                if os.stat(current_file_path).st_size == 0:
+                    print("[INFO] File EVE bị truncate. Mở lại...")
+                    file.close()
+                    file = open(current_file_path, "r")
+            except FileNotFoundError:
+                print("[INFO] File EVE bị di chuyển. Tìm file mới...")
+                file = None
+            except Exception as e:
+                print(f"[ERROR] Lỗi khi kiểm tra file: {e}")
+            
+            time.sleep(0.1)
+            continue
+        
+        yield line
 
 
 def clean_payload_for_json(payload_str):
-    """Làm sạch payload cơ bản."""
-    payload_str = re.sub(r'"[^"]*\s*\*\s*\d+"', '"REPEATED_DATA"', payload_str)
-    return payload_str
-
-
-# <<< ĐÃ XÓA HÀM process_http_event >>>
+    """Loại bỏ các ký tự không hợp lệ (control chars) khỏi payload."""
+    return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", payload_str)
 
 
 def process_mqtt_event(event, write_api):
-    """Xử lý tất cả sự kiện MQTT và Flow (đã vá)."""
+    """Xử lý tất cả sự kiện MQTT và Flow (đã sửa lỗi gộp trường)."""
     timestamp = event.get("timestamp")
     src_ip = event.get("src_ip")
     dest_ip = event.get("dest_ip")
     src_port = event.get("src_port")
     dest_port = event.get("dest_port")
-
-    if not src_ip:
+    
+    flow_id = event.get("flow_id")
+    if not flow_id:
         return
 
-    client_id = "unknown"
+    # Lấy client_id từ cache nếu có
+    client_id = client_map.get(flow_id, "unknown")
 
-    # Lấy client_id từ cache
-    key = (src_ip, src_port)
-    if key in client_map:
-        client_id, last_seen = client_map[key]
-        client_map[key] = (client_id, datetime.utcnow())
-
-    # 1. XỬ LÝ FLOW EVENT (cho Rule 2)
+    # 1. XỬ LÝ FLOW EVENT
     if event.get("app_proto") == "mqtt" and event.get("event_type") == "flow":
         flow = event.get("flow", {})
         bytes_toserver = flow.get("bytes_toserver", 0)
         pkts_toserver = flow.get("pkts_toserver", 0)
         state = flow.get("state", "unknown")
-
+        
         mqtt_type = "publish_flow" if bytes_toserver > 200 else "flow"
 
         point = (
@@ -118,72 +126,76 @@ def process_mqtt_event(event, write_api):
             .tag("src_port", str(src_port) if src_port else "")
             .tag("dest_ip", dest_ip or "")
             .tag("dest_port", str(dest_port) if dest_port else "")
-            .tag("client_id", client_id) # Dùng client_id từ cache
+            .tag("client_id", client_id) 
             .field("bytes_toserver", bytes_toserver)
             .field("pkts_toserver", pkts_toserver)
             .field("state", state)
-            .field("topic", "unknown_flow_topic") # Đảm bảo field 'topic' tồn tại
+            .field("topic", "unknown_flow_topic")
             .field("payload_raw", f"Flow data: {bytes_toserver} bytes")
             .time(timestamp, WritePrecision.NS)
         )
         write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
+        
+        if state == "closed":
+            if flow_id in client_map:
+                del client_map[flow_id]
+            
         print(
             f"[WRITE FLOW] {mqtt_type} | {src_ip}:{src_port or '?'} | client_id: {client_id} | bytes: {bytes_toserver}")
         return
 
-    # 2. XỬ LÝ SỰ KIỆN APP-LAYER (connect, publish, subscribe, connack, v.v.)
+    # 2. XỬ LÝ SỰ KIỆN APP-LAYER
     mqtt_data = event.get("mqtt", {})
     if not mqtt_data:
         return
 
-    mqtt_type = list(mqtt_data.keys())[0]  # vd: 'connect', 'publish', 'subscribe', 'connack'
-    mqtt_value = mqtt_data[mqtt_type]  # data bên trong
+    # <<< THAY ĐỔI: Xác định loại sự kiện chính >>>
+    # Log của bạn cho thấy 'connect' và 'connack' đi cùng nhau.
+    # Chúng ta sẽ ưu tiên 'connect' làm type chính.
+    mqtt_type = "unknown"
+    if "connect" in mqtt_data:
+        mqtt_type = "connect"
+    elif "publish" in mqtt_data:
+        mqtt_type = "publish"
+    elif "subscribe" in mqtt_data:
+        mqtt_type = "subscribe"
+    elif mqtt_data:
+        mqtt_type = list(mqtt_data.keys())[0] # Fallback
 
-    # Cập nhật client_id từ CONNECT
-    if mqtt_type == "connect" and "client_id" in mqtt_value:
-        client_id = mqtt_value["client_id"]
-        key = (src_ip, src_port)
-        client_map[key] = (client_id, datetime.utcnow())
-
-
-    # 3. XỬ LÝ ĐẶC BIỆT CHO 'SUBSCRIBE' (cho Rule 5, 6)
-    if mqtt_type == "subscribe" and "topics" in mqtt_value:
-        all_topics = mqtt_value.get("topics", [])
-        msg_id = mqtt_value.get("message_id")
-        
-        print(f"[WRITE SUB] {mqtt_type} | {src_ip}:{src_port or '?'} | client_id: {client_id} | {len(all_topics)} topics")
-
-        for sub_topic in all_topics:
-            topic_name = sub_topic.get("topic")
-            topic_qos = sub_topic.get("qos")
-            
+    # 3. XỬ LÝ ĐẶC BIỆT CHO 'SUBSCRIBE'
+    if mqtt_type == "subscribe":
+        topics = mqtt_data.get("subscribe", {}).get("topics", [])
+        for sub_topic in topics:
+            if isinstance(sub_topic, dict):
+                topic_name = sub_topic.get("topic")
+                qos = sub_topic.get("qos", 0)
+            else:
+                topic_name = str(sub_topic)
+                qos = 0
+                
             if not topic_name:
                 continue
 
             point = (
                 Point("mqtt_event")
-                .tag("mqtt_type", mqtt_type)
+                .tag("mqtt_type", "subscribe")
                 .tag("src_ip", src_ip)
                 .tag("src_port", str(src_port) if src_port else "")
                 .tag("dest_ip", dest_ip or "")
                 .tag("dest_port", str(dest_port) if dest_port else "")
                 .tag("client_id", client_id)
+                .field("topic", topic_name)
+                .field("qos", qos)
+                .field("message_id", mqtt_data.get("subscribe", {}).get("message_id", 0))
+                .field("payload_raw", f"Subscribe to: {topic_name}")
                 .time(timestamp, WritePrecision.NS)
             )
-
-            # Ghi CÁC TRƯỜNG GIỐNG NHƯ PUBLISH
-            point = point.field("topic", topic_name) # Đây là trường quan trọng
-            if topic_qos is not None:
-                point = point.field("qos", topic_qos)
-            if msg_id is not None:
-                point = point.field("message_id", msg_id)
-            
             write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
-        
-        return # Đã xử lý xong 'subscribe', thoát
+            
+        print(f"[WRITE SUB] {mqtt_type} | {src_ip}:{src_port or '?'} | client_id: {client_id} | topics: {len(topics)}")
+        return
 
-    # 4. XỬ LÝ CHUNG CHO CÁC GÓI TIN KHÁC (Connect, Publish, Connack, Suback, v.v.)
-    
+    # 4. XỬ LÝ CHUNG (CONNECT, PUBLISH,...)
     point = (
         Point("mqtt_event")
         .tag("mqtt_type", mqtt_type)
@@ -191,72 +203,86 @@ def process_mqtt_event(event, write_api):
         .tag("src_port", str(src_port) if src_port else "")
         .tag("dest_ip", dest_ip or "")
         .tag("dest_port", str(dest_port) if dest_port else "")
-        .tag("client_id", client_id)
+        .tag("client_id", client_id) # Sẽ được cập nhật ngay sau đây
         .time(timestamp, WritePrecision.NS)
     )
+    
+    # <<< THAY ĐỔI LỚN: Gộp tất cả các trường từ các sub-object (connect, connack, v.v.) >>>
+    flat_fields = {}
+    for key, value_dict in mqtt_data.items():
+        if isinstance(value_dict, dict):
+            flat_fields.update(value_dict)
+    
+    # Cập nhật client_id từ dữ liệu đã gộp
+    if "client_id" in flat_fields:
+        client_id = flat_fields["client_id"]
+        point = point.tag("client_id", client_id) # Cập nhật tag
+        if mqtt_type == "connect":
+            client_map[flow_id] = client_id # Cập nhật cache
 
-    # 1. Các trường top-level (Gồm: qos, retain, return_code, v.v.)
+    if mqtt_type == "disconnect":
+        if flow_id in client_map:
+            del client_map[flow_id]
+    
+    # 1. Các trường top-level (từ tất cả các sub-object đã gộp)
     for field in MQTT_FIELDS_TOP:
-        if field in mqtt_value:
-            point = point.field(field, mqtt_value[field])
+        if field in flat_fields:
+            # Ghi cả 'username' (từ connect) và 'return_code' (từ connack)
+            point = point.field(field, flat_fields[field])
 
-    # 2. Các trường là JSON/list (Bỏ qua 'topics' vì đã xử lý)
+    # 2. Các trường JSON
     for field in MQTT_FIELDS_JSON:
-        if field == "topics": continue
-        if field in mqtt_value:
-            point = point.field(field, json.dumps(mqtt_value[field]))
-
-    # 3. Các trường 'flags' (cho 'connect')
-    if "flags" in mqtt_value and isinstance(mqtt_value["flags"], dict):
-        flags = mqtt_value["flags"]
-        for flag in MQTT_FIELDS_FLAGS:
-            if flag in flags:
-                point = point.field(f"flags_{flag}", flags[flag])
-
-    # 4. Trường client_id (cho Rule 8)
-    if "client_id" in mqtt_value:
-        point = point.field("client_identifier", mqtt_value["client_id"])
-
-    # 5. Xử lý payload (cho 'publish' - Rule 3)
-    if mqtt_type == "publish":
-        payload = mqtt_value.get("payload") or mqtt_value.get("payload_printable", "")
-        if payload:
-            cleaned = clean_payload_for_json(str(payload))
-            point = point.field("payload_raw", cleaned[:PAYLOAD_LIMIT])
-
-            # Thử flatten payload nếu là JSON
+        if field in flat_fields:
             try:
-                payload_data = json.loads(cleaned)
-                if isinstance(payload_data, dict):
-                    def flatten_payload(d, parent_key='payload', sep='_'):
-                        items = []
-                        for k, v in d.items():
-                            new_key = f"{parent_key}{sep}{k}" if parent_key else k
-                            if isinstance(v, dict):
-                                items.extend(flatten_payload(v, new_key, sep=sep).items())
-                            else:
-                                items.append((new_key, str(v)))
-                        return dict(items)
+                json_str = json.dumps(flat_fields[field])
+                point = point.field(field, json_str)
+            except TypeError:
+                point = point.field(field, str(flat_fields[field]))
 
-                    payload_flattened = flatten_payload(payload_data)
-                    for pkey, pvalue in payload_flattened.items():
-                        point = point.field(pkey, pvalue)
-                else:
-                    point = point.field("payload_value", str(payload_data))
-            except json.JSONDecodeError:
-                pass  # Đã ghi payload_raw
+    # 3. Các trường 'flags'
+    flags_dict = flat_fields.get("flags") 
+    if isinstance(flags_dict, dict):
+         for flag in MQTT_FIELDS_FLAGS:
+            if flag in flags_dict:
+                point = point.field(f"flag_{flag}", flags_dict[flag])
+
+    # 4. Ghi lại client_id
+    if "client_id" in flat_fields:
+        point = point.field("client_identifier", flat_fields["client_id"])
+    
+    # 5. Xử lý payload (chỉ cho 'publish')
+    payload_raw = "N/A"
+    if mqtt_type == "publish":
+        payload_str = flat_fields.get("payload", "")
+        payload_len = len(payload_str)
+        point = point.field("payload_len", payload_len)
+
+        if payload_len > 0:
+            try:
+                cleaned_payload = clean_payload_for_json(payload_str)
+                payload_raw = cleaned_payload[:PAYLOAD_LIMIT]
+                point = point.field("payload_raw", payload_raw)
+                try:
+                    payload_json = json.loads(cleaned_payload)
+                    if isinstance(payload_json, dict):
+                        for k, v in payload_json.items():
+                            if isinstance(v, (str, int, float, bool)):
+                                point = point.field(f"p_{k}", v)
+                except json.JSONDecodeError:
+                    pass
+            except Exception:
+                pass
+    
+    if "payload_raw" not in point._fields:
+         point = point.field("payload_raw", payload_raw)
 
     write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=point)
-    print(f"[WRITE] {mqtt_type} | {src_ip}:{src_port or '?'} | client_id: {client_id}")
-
-    if len(client_map) % 100 == 0:
-        cleanup_client_map()
+    print(f"[WRITE] {mqtt_type} | {src_ip}:{src_port or '?'} | client_id: {client_id} | RC: {flat_fields.get('return_code', 'N/A')}")
 
 
 def main():
-    print("MQTT EVE Forwarder (MQTT ONLY) Starting...")
+    print("MQTT EVE Forwarder (ĐÃ SỬA LỖI GỘP FIELD) Starting...")
     
-    # Thử kết nối tới InfluxDB trước khi bắt đầu
     while True:
         try:
             client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG, timeout=10000)
@@ -278,18 +304,13 @@ def main():
             event_type = event.get("event_type")
             app_proto = event.get("app_proto")
 
-            # <<< ĐÃ THAY ĐỔI >>>
-            # Chỉ xử lý sự kiện MQTT
             if event_type == "mqtt" or (app_proto == "mqtt" and event_type == "flow"):
                 process_mqtt_event(event, write_api)
-            
-            # (Các sự kiện khác như 'http', 'alert', 'dns' sẽ bị bỏ qua)
 
         except json.JSONDecodeError:
-            continue
+            print(f"[WARN] Bỏ qua dòng JSON không hợp lệ: {line[:100]}...")
         except Exception as e:
-            print(f"[ERROR] Lỗi xử lý dòng: {e} | Dòng: {line[:200]}...")
-
+            print(f"[ERROR] Lỗi xử lý sự kiện: {e} | DATA: {line[:200]}...")
 
 if __name__ == "__main__":
     main()

@@ -10,6 +10,8 @@ import yagmail
 import os
 import warnings
 import json
+import math
+from collections import Counter
 
 # --- Ignore warnings ---
 warnings.filterwarnings("ignore", message=".*arrow.*", category=FutureWarning)
@@ -27,18 +29,18 @@ EMAIL_PASS = os.getenv("EMAIL_PASS")
 EMAIL_TO = os.getenv("EMAIL_TO", "").split(",")
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "5"))
-WINDOW_SECONDS = int(os.getenv("WINDOW_SECONDS", "300"))
+WINDOW_SECONDS = int(os.getenv("WINDOW_SECONDS", "60"))
 PAYLOAD_LIMIT = int(os.getenv("PAYLOAD_LIMIT", "1024"))
 RETAIN_QOS_LIMIT = int(os.getenv("RETAIN_QOS_LIMIT", "5"))
 RECONNECT_LIMIT = int(os.getenv("RECONNECT_LIMIT", "10"))
 PUBLISH_FLOOD_LIMIT = int(os.getenv("PUBLISH_FLOOD_LIMIT", "100"))
+PAYLOAD_ATTACK_THRESHOLD = int(os.getenv("PAYLOAD_ATTACK_THRESHOLD", "5000"))
 
-# --- *** THAY ĐỔI THEO YÊU CẦU *** ---
+# --- Ngưỡng đã giảm theo yêu cầu ---
 ENUM_LIMIT = int(os.getenv("ENUM_LIMIT", "10")) # Giảm từ 20 xuống 10
 BRUTE_FORCE_LIMIT = int(os.getenv("BRUTE_FORCE_LIMIT", "5")) # Thêm mới, ngưỡng 5
-# --- *** KẾT THÚC THAY ĐỔI *** ---
 
-ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "3600")) # 1 giờ
+ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "60")) # 1 phút
 
 # --- Cấu hình Rule ---
 ALLOWED_TOPICS_REGEX = [
@@ -61,8 +63,8 @@ SUSPICIOUS_PAYLOAD_KEYWORDS = [
 
 # --- CẤU HÌNH WHITELIST ---
 WHITELISTED_CLIENT_PREFIXES = [
-    "giamdoc_gay", "truongphong_security", "truongphong_office", "truongphong_production",
-    "sensor_", "meter_", "printer_", "pc_", "plc_", "robot_", "cam_", "access_", "forklift_",  
+    "truongphong_office_sub", "truongphong_energy_sub", "truongphong_production_sub",
+    "truongphong_storage_sub", "truongphong_security_sub"
 ]
 
 # --- Global state ---
@@ -98,119 +100,60 @@ def send_email(subject, body):
     else:
         print("[ALERT] Email client not configured, skipping send.")
 
-def write_alert(write_api, rule_name, src_ip, client_id, message):
+# --- Đã xóa src_ip khỏi hàm write_alert ---
+def write_alert(write_api, rule_name, client_id, message):
     """Write an alert to the InfluxDB alert bucket."""
     point = Point("mqtt_alert") \
         .tag("rule", rule_name) \
-        .tag("src_ip", str(src_ip)) \
         .tag("client_id", str(client_id)) \
         .field("message", str(message)) \
         .time(datetime.utcnow(), WritePrecision.NS)
     
     write_api.write(bucket=ALERT_BUCKET, org=INFLUX_ORG, record=point)
-    print(f"[ALERT] Rule: {rule_name} | Client: {client_id} | IP: {src_ip} | Msg: {message}")
+    print(f"[ALERT] Rule: {rule_name} | Client: {client_id} | Msg: {message}")
 
 
-# --- Rule Functions ---
+# --- Rule Functions (Không bị ảnh hưởng) ---
 
-def detect_duplicate_client_id(df, write_api):
-    """
-    Detects duplicate client_id usage by checking for the same client_id 
-    used from MORE THAN ONE UNIQUE SOURCE PORT. This is resilient to 
-    Load Balancer/Proxy IPs (fixed src_ip).
-    """
-    connect_df = df[df["mqtt_type"] == "connect"].copy()
-    if connect_df.empty:
-        return
+# def detect_duplicate_client_id(df, write_api):
+#     connect_df = df[df["mqtt_type"] == "connect"].copy()
+#     if connect_df.empty:
+#         return
         
-    # LOGIC MỚI: Nhóm theo client_id và đếm số lượng src_port duy nhất
-    # src_port khác nhau => kết nối vật lý khác nhau
-    client_ports = connect_df.groupby("client_id")["src_port"].nunique()
-    duplicates = client_ports[client_ports > 1] # Nếu có nhiều hơn 1 cổng nguồn sử dụng cùng 1 client_id
+#     client_ports = connect_df.groupby("client_id")["src_port"].nunique()
+#     duplicates = client_ports[client_ports > 1] 
     
-    for client_id, port_count in duplicates.items():
-        if not client_id or client_id == "unknown":
-            continue
+#     for client_id, port_count in duplicates.items():
+#         if not client_id or client_id == "unknown":
+#             continue
         
-        # Lấy một IP bất kỳ (sẽ là IP của Proxy) để ghi log
-        # Đảm bảo cột src_ip có dữ liệu trước khi truy cập
-        src_ip = connect_df[connect_df["client_id"] == client_id]["src_ip"].iloc[0] if "src_ip" in connect_df.columns else "unknown"
-        
-        key = ("duplicate_client_id", client_id)
-        if should_alert(key):
-            msg = f"Duplicate client_id: '{client_id}' seen using {port_count} different source ports from IP {src_ip} (Proxy)"
-            write_alert(write_api, "duplicate_client_id", src_ip, client_id, msg)
-            send_email("MQTT Security Alert: Duplicate Client ID", msg)
+#         key = ("duplicate_client_id", client_id)
+#         if should_alert(key):
+#             msg = f"Duplicate client_id: '{client_id}' seen using {port_count} different source ports."
+#             write_alert(write_api, "duplicate_client_id", client_id, msg)
+#             send_email("MQTT Security Alert: Duplicate Client ID", msg)
 
 def detect_reconnect_storm(df, write_api):
-    # Detect reconnect storm (rapid connect/disconnect)
-    connect_events = df[df["mqtt_type"].isin(["connect", "disconnect"])]
+    connect_events = df[df["mqtt_type"].isin(["connect", "disconnect"])].copy()
     if connect_events.empty:
         return
 
-    # SỬA: Nhóm theo client_id 
+    # ⚠️ Bỏ qua các client có alert payload trước đó
+    if "payload_len" in df.columns:
+        oversized_clients = set(df.loc[df["payload_len"] > PAYLOAD_ATTACK_THRESHOLD, "client_id"].dropna())
+        connect_events = connect_events[~connect_events["client_id"].isin(oversized_clients)]
+
     storm_counts = connect_events.groupby("client_id").size().reset_index(name="count")
     for _, row in storm_counts.iterrows():
         if row["count"] > RECONNECT_LIMIT and row["client_id"] != "unknown":
-            
             key = ("reconnect_storm", row["client_id"]) 
             if should_alert(key):
-                src_ip = df[df["client_id"] == row["client_id"]]["src_ip"].iloc[0] if "src_ip" in df.columns else "unknown"
-                msg = f"Reconnect storm: {row['count']} connect/disconnect events from client '{row['client_id']}' ({src_ip})"
-                
-                write_alert(write_api, "reconnect_storm", src_ip, row["client_id"], msg)
+                msg = f"Reconnect storm: {row['count']} connect/disconnect events from client '{row['client_id']}'"
+                write_alert(write_api, "reconnect_storm", row["client_id"], msg)
                 send_email("MQTT Security Alert: Reconnect Storm", msg)
 
-def detect_wildcard_abuse(df, write_api):
-    # Detect wildcard abuse in subscribe topics
-    subscribe_df = df[df["mqtt_type"] == "subscribe"].copy()
-    if subscribe_df.empty:
-        return
-
-    if "topics" in subscribe_df.columns:
-        
-        # --- SỬA LỖI LOGIC GIẢI MÃ JSON (Tương tự Topic Enumeration) ---
-        sub_df = subscribe_df.dropna(subset=["topics"])[["client_id", "src_ip", "topics"]].copy()
-        if sub_df.empty:
-            return
-
-        def parse_json_topics(json_string):
-            try:
-                topics = json.loads(json_string)
-                if isinstance(topics, list):
-                    return topics
-            except Exception:
-                pass
-            return []
-
-        sub_df["topics_list"] = sub_df["topics"].apply(parse_json_topics)
-        exploded_df = sub_df.explode("topics_list")
-        
-        def get_topic(topic_entry):
-            if isinstance(topic_entry, dict):
-                return topic_entry.get("topic")
-            return str(topic_entry) 
-
-        exploded_df["topic_str"] = exploded_df["topics_list"].apply(get_topic)
-        # --- KẾT THÚC SỬA LỖI ---
-        
-        wildcard_abuse = exploded_df[exploded_df["topic_str"].str.contains(r"#|.*\+.*", na=False)]
-        for _, row in wildcard_abuse.iterrows():
-            
-            # --- *** SỬA LỖI LOGIC *** ---
-            # 3 dòng code lỗi (if...continue) đã bị XÓA BỎ khỏi đây.
-            # Giờ đây rule sẽ phát hiện '#' và '+'
-            
-            # Key cooldown là (rule, client_id, topic)
-            key = ("wildcard_abuse", row["client_id"], row["topic_str"])
-            if should_alert(key):
-                src_ip = row.get("src_ip", "unknown")
-                msg = f"Wildcard abuse: Client {row['client_id']} ({src_ip}) subscribed to '{row['topic_str']}'"
-                write_alert(write_api, "wildcard_abuse", src_ip, row["client_id"], msg)
-                send_email("MQTT Security Alert: Wildcard Abuse", msg)
 
 def detect_retain_qos_abuse(df, write_api):
-    # Detect high QoS + Retain flag 
     publish_df = df[df["mqtt_type"] == "publish"].copy()
     if publish_df.empty:
         return
@@ -220,200 +163,95 @@ def detect_retain_qos_abuse(df, write_api):
 
     abuse_df = publish_df[(publish_df["retain_bool"] == True) | (publish_df["qos_num"] > 0)]
     
-    # SỬA: Nhóm theo client_id 
     abuse_counts = abuse_df.groupby("client_id").size().reset_index(name="count")
     for _, row in abuse_counts.iterrows():
         if row["count"] > RETAIN_QOS_LIMIT and row["client_id"] != "unknown":
             
             key = ("retain_qos_abuse", row["client_id"])
             if should_alert(key):
-                src_ip = df[df["client_id"] == row["client_id"]]["src_ip"].iloc[0] if "src_ip" in df.columns else "unknown"
-                msg = f"Retain/QoS abuse: {row['count']} messages with Retain=True and QoS>0 from client '{row['client_id']}' ({src_ip})"
-                
-                write_alert(write_api, "retain_qos_abuse", src_ip, row["client_id"], msg)
+                msg = f"Retain/QoS abuse: {row['count']} messages with Retain=True and QoS>0 from client '{row['client_id']}'"
+                write_alert(write_api, "retain_qos_abuse", row["client_id"], msg)
                 send_email("MQTT Security Alert: Retain/QoS Abuse", msg)
 
-def detect_payload_anomaly(df, write_api):
-    # Detect payload anomalies (large size, suspicious keywords)
-    publish_df = df[df["mqtt_type"] == "publish"].dropna(subset=["payload_raw"]).copy()
+
+def detect_payload_flow_anomaly(df, write_api):
+    """
+    Rule – Payload Oversize Detection (Simplified)
+    Phát hiện các bản tin MQTT có payload_len vượt ngưỡng cho phép.
+    Loại bỏ hoàn toàn các phép tính entropy và tổng byte để tránh cảnh báo giả.
+    """
+    publish_df = df[df["mqtt_type"] == "publish"].copy()
     if publish_df.empty:
         return
 
+    # Đảm bảo cột payload_len tồn tại và là số
+    if "payload_len" not in publish_df.columns:
+        publish_df["payload_len"] = publish_df["payload_raw"].astype(str).apply(
+            lambda s: len(s.encode("utf-8")) if isinstance(s, str) else 0
+        )
+    publish_df["payload_len"] = pd.to_numeric(publish_df["payload_len"], errors="coerce").fillna(0).astype(int)
+
+    # Lặp qua từng bản tin và kiểm tra ngưỡng
     for _, row in publish_df.iterrows():
-        if row["client_id"] == "unknown":
+        cid = row.get("client_id", "unknown")
+        if cid == "unknown":
             continue
+        topic = row.get("topic", "")
+        plen = int(row.get("payload_len", 0))
 
-        payload = str(row["payload_raw"])
-        src_ip = row.get("src_ip", "unknown")
-        
-        # 1. Check size
-        if len(payload) > PAYLOAD_LIMIT:
-            key = ("payload_large", row["client_id"])
+        if plen > PAYLOAD_ATTACK_THRESHOLD:
+            key = ("publish_payload_large", cid)
             if should_alert(key):
-                msg = f"Large payload: {len(payload)} bytes from {src_ip} ({row['client_id']}) on topic '{row['topic']}'"
-                write_alert(write_api, "payload_large", src_ip, row["client_id"], msg)
-                send_email("MQTT Security Alert: Large Payload", msg)
-        
-        # 2. Check keywords
-        payload_lower = payload.lower()
-        for keyword in SUSPICIOUS_PAYLOAD_KEYWORDS:
-            if keyword.lower() in payload_lower:
-                key = ("payload_suspicious", row["client_id"], keyword)
-                if should_alert(key):
-                    msg = f"Suspicious payload: Keyword '{keyword}' found in payload from {src_ip} ({row['client_id']}) on topic '{row['topic']}'"
-                    write_alert(write_api, "payload_suspicious", src_ip, row["client_id"], msg)
-                    send_email("MQTT Security Alert: Suspicious Payload", msg)
-                    break 
-
-def detect_unauthorized_topics(df, write_api):
-    # Detect publish/subscribe to unauthorized topics
-    if not ALLOWED_TOPICS_REGEX:
-        return
-        
-    allowed_topics_pattern = re.compile("|".join(f"({r})" for r in ALLOWED_TOPICS_REGEX))
-
-    # Xử lý publish (có cột 'topic')
-    publish_df = df[df["mqtt_type"] == "publish"].dropna(subset=["topic"]).copy()
-    for _, row in publish_df.iterrows():
-        if row["client_id"] == "unknown": continue
-        topic = row["topic"]
-        src_ip = row.get("src_ip", "unknown")
-        
-        if not allowed_topics_pattern.fullmatch(topic):
-            key = ("unauth_topic", row["client_id"], topic)
-            if should_alert(key):
-                msg = f"Unauthorized publish: Client {row['client_id']} ({src_ip}) published to unauthorized topic '{topic}'"
-                write_alert(write_api, "unauth_topic", src_ip, row["client_id"], msg)
-                send_email("MQTT Security Alert: Unauthorized Topic", msg)
-
-    # Xử lý subscribe (có cột 'topics' là list/JSON string)
-    subscribe_df = df[df["mqtt_type"] == "subscribe"].dropna(subset=["topics"]).copy()
-    if "topics" in subscribe_df.columns:
-        
-        # --- SỬA LỖI LOGIC GIẢI MÃ JSON (Tương tự Topic Enumeration) ---
-        sub_df = subscribe_df.dropna(subset=["topics"])[["client_id", "src_ip", "topics"]].copy()
-        if sub_df.empty:
-            return
-
-        def parse_json_topics(json_string):
-            try:
-                topics = json.loads(json_string)
-                if isinstance(topics, list):
-                    return topics
-            except Exception:
-                pass
-            return []
-
-        sub_df["topics_list"] = sub_df["topics"].apply(parse_json_topics)
-        exploded_df = sub_df.explode("topics_list")
-        
-        def get_topic(topic_entry):
-            if isinstance(topic_entry, dict): return topic_entry.get("topic")
-            return str(topic_entry)
-        
-        exploded_df["topic_str"] = exploded_df["topics_list"].apply(get_topic)
-        # --- KẾT THÚC SỬA LỖI ---
-        
-        for _, row in exploded_df.iterrows():
-            if row["client_id"] == "unknown": continue
-            topic = row["topic_str"]
-            src_ip = row.get("src_ip", "unknown")
-            
-            if not topic: continue
-            if not allowed_topics_pattern.fullmatch(topic):
-                key = ("unauth_topic", row["client_id"], topic)
-                if should_alert(key):
-                    msg = f"Unauthorized subscribe: Client {row['client_id']} ({src_ip}) subscribed to unauthorized topic '{topic}'"
-                    write_alert(write_api, "unauth_topic", src_ip, row["client_id"], msg)
-                    send_email("MQTT Security Alert: Unauthorized Topic", msg)
+                msg = f"Oversized payload detected: {plen} bytes from client '{cid}' on topic '{topic}' (threshold={PAYLOAD_ATTACK_THRESHOLD})"
+                write_alert(write_api, "publish_payload_large", cid, msg)
+                send_email("MQTT Security Alert: Oversized Payload", msg)
 
 def detect_publish_flood(df, write_api):
-    # Detect publish flood from a single client
-    publish_df = df[df["mqtt_type"] == "publish"]
+    """
+    Rule 4 – Publish Flood (Cải tiến)
+    Phát hiện client gửi quá nhiều bản tin publish hoặc tổng dung lượng payload lớn bất thường.
+    """
+    publish_df = df[df["mqtt_type"] == "publish"].copy()
     if publish_df.empty:
         return
+
+    # Bổ sung: tính độ dài payload nếu chưa có
+    if "payload_len" not in publish_df.columns:
+        publish_df["payload_len"] = publish_df["payload_raw"].astype(str).apply(len)
+    else:
+        publish_df["payload_len"] = pd.to_numeric(publish_df["payload_len"], errors="coerce").fillna(0)
+
+    # Gộp theo client_id
+    agg_df = publish_df.groupby("client_id").agg(
+        message_count=("mqtt_type", "count"),
+        total_bytes=("payload_len", "sum")
+    ).reset_index()
+
+    for _, row in agg_df.iterrows():
+        cid = row["client_id"]
+        if cid == "unknown":
+            continue
         
-    # SỬA: Nhóm theo client_id
-    flood_counts = publish_df.groupby("client_id").size().reset_index(name="count")
-    for _, row in flood_counts.iterrows():
-        if row["count"] > PUBLISH_FLOOD_LIMIT and row["client_id"] != "unknown":
-            key = ("publish_flood", row["client_id"])
+        msg_count = int(row["message_count"])
+        total_bytes = int(row["total_bytes"])
+
+        # Ngưỡng cảnh báo (có thể tinh chỉnh)
+        msg_limit = PUBLISH_FLOOD_LIMIT
+        byte_limit = PUBLISH_FLOOD_LIMIT * 5000  # ví dụ: 100 messages ≈ 500 KB
+
+        if msg_count > msg_limit or total_bytes > byte_limit:
+            key = ("publish_flood", cid)
             if should_alert(key):
-                src_ip = df[df["client_id"] == row["client_id"]]["src_ip"].iloc[0] if "src_ip" in df.columns else "unknown"
-                msg = f"Publish flood: {row['count']} publish messages from client '{row['client_id']}' ({src_ip})"
-                write_alert(write_api, "publish_flood", src_ip, row["client_id"], msg)
+                msg = (
+                    f"Publish flood detected: client '{cid}' sent {msg_count} publish messages "
+                    f"totaling {total_bytes} bytes in the last window."
+                )
+                write_alert(write_api, "publish_flood", cid, msg)
                 send_email("MQTT Security Alert: Publish Flood", msg)
+                print(f"[ALERT] Rule: publish_flood | Client: {cid} | Msgs: {msg_count} | Bytes: {total_bytes}")
 
-# ===================================================================
-# === HÀM ĐÃ SỬA LỖI ===
-# ===================================================================
-def detect_topic_enumeration(df, write_api):
-    # Detect topic enumeration (many unique topics from one client)
-    pub_sub_df = df[df["mqtt_type"].isin(["publish", "subscribe"])]
-    if pub_sub_df.empty:
-        return
-    
-    # Logic trích xuất topic_str từ publish (đã đúng)
-    pub_topics = pub_sub_df.dropna(subset=["topic"])[["client_id", "topic"]] if "topic" in pub_sub_df.columns else pd.DataFrame(columns=["client_id", "topic"])
-
-    # --- SỬA LỖI LOGIC SUBSCRIBE ---
-    sub_topics_list = []
-    if "topics" in pub_sub_df.columns:
-        # 1. Lấy dữ liệu subscribe và dropna, copy để tránh warning
-        sub_df = pub_sub_df.dropna(subset=["topics"])[["client_id", "topics"]].copy()
-        
-        if not sub_df.empty:
-            # 2. Hàm helper để parse chuỗi JSON (e.g., "[\"topic/a\"]") thành list (e.g., ["topic/a"])
-            def parse_json_topics(json_string):
-                try:
-                    topics = json.loads(json_string) # json.loads giải mã chuỗi
-                    if isinstance(topics, list):
-                        return topics
-                except Exception:
-                    pass # Bỏ qua nếu JSON không hợp lệ
-                return [] # Trả về list rỗng nếu lỗi
-
-            # 3. Áp dụng hàm parse: Chuyển cột 'topics' (string) thành 'topics_list' (list)
-            sub_df["topics_list"] = sub_df["topics"].apply(parse_json_topics)
-
-            # 4. Explode trên cột 'topics_list' (list)
-            exploded_df = sub_df.explode("topics_list")
-
-            # 5. Hàm helper để trích xuất topic (vì 1 phần tử có thể là string hoặc dict)
-            def get_topic(topic_entry):
-                if isinstance(topic_entry, dict): 
-                    return topic_entry.get("topic")
-                return str(topic_entry) # Chỉ là string
-            
-            # 6. Trích xuất topic_str từ cột 'topics_list' đã explode
-            exploded_df["topic_str"] = exploded_df["topics_list"].apply(get_topic)
-            
-            # 7. Thêm vào danh sách cuối cùng
-            sub_topics_list.append(exploded_df[["client_id", "topic_str"]].rename(columns={"topic_str": "topic"}))
-    # --- KẾT THÚC SỬA LỖI ---
-    
-    all_topics = pd.concat([pub_topics] + sub_topics_list).dropna(subset=["client_id", "topic"])
-
-    if all_topics.empty:
-        return
-    
-    # SỬA: Nhóm theo client_id 
-    unique_topic_counts = all_topics.groupby("client_id")["topic"].nunique()
-    
-    for client_id, count in unique_topic_counts.items():
-        if count > ENUM_LIMIT and client_id != "unknown": # <-- Ngưỡng đã được giảm
-            key = ("topic_enumeration", client_id)
-            if should_alert(key):
-                src_ip = df[df["client_id"] == client_id]["src_ip"].iloc[0] if "src_ip" in df.columns else "unknown"
-                msg = f"Topic enumeration: Client '{client_id}' ({src_ip}) accessed {count} unique topics"
-                write_alert(write_api, "topic_enumeration", src_ip, client_id, msg)
-                send_email("MQTT Security Alert: Topic Enumeration", msg)
-# ===================================================================
-# === KẾT THÚC HÀM SỬA LỖI ===
-# ===================================================================
 
 def detect_suspicious_client_id(df, write_api):
-    # Detect suspicious client_id prefixes
     if not SUSPICIOUS_CLIENT_ID_PREFIXES:
         return
     if "client_id" not in df.columns:
@@ -426,52 +264,174 @@ def detect_suspicious_client_id(df, write_api):
             if client_id_lower.startswith(prefix.lower()):
                 key = ("suspicious_client_id", client_id)
                 if should_alert(key):
-                    row = df[df["client_id"] == client_id].iloc[0]
-                    src_ip = row.get("src_ip", "unknown")
-                    msg = f"Suspicious client_id detected: '{client_id}' matches prefix '{prefix}' from {src_ip}"
-                    write_alert(write_api, "suspicious_client_id", src_ip, client_id, msg)
+                    msg = f"Suspicious client_id detected: '{client_id}' matches prefix '{prefix}'"
+                    write_alert(write_api, "suspicious_client_id", client_id, msg)
                     send_email("Suspicious MQTT Client ID", msg)
                 break 
 
-# --- *** RULE MỚI ĐƯỢC THÊM VÀO *** ---
+
 def detect_brute_force(df, write_api):
     """
-    Detects brute-force login attempts.
-    This rule assumes failed logins are logged as 'connect' events
-    with a 'return_code' == 5 (Not authorized).
+    Rule - Brute Force Detection (Logic 'return_code' CHUẨN)
+    Phát hiện bằng cách lọc các sự kiện 'connect' (vì forwarder đã gộp)
+    có 'return_code' là 4 (Bad username/password) hoặc 5 (Not authorized).
     """
-    if "return_code" not in df.columns:
-        print("[WARN] 'return_code' column not found, skipping brute_force rule.")
-        return
     
+    # Lọc các sự kiện 'connect'
+    # File chuẩn hóa của chúng ta đặt mqtt_type="connect"
+    # và gộp cả trường 'return_code' vào đó
     connect_df = df[df["mqtt_type"] == "connect"].copy()
     if connect_df.empty:
         return
 
-    # Convert return_code to numeric, errors will become NaN
-    connect_df["rc_num"] = pd.to_numeric(connect_df["return_code"], errors="coerce")
+    # Đảm bảo return_code là số
+    connect_df["return_code_num"] = pd.to_numeric(connect_df["return_code"], errors="coerce")
 
-    # Filter for failed authorization (return_code == 5)
-    failed_auth_df = connect_df[connect_df["rc_num"] == 5]
-    if failed_auth_df.empty:
+    # Lọc các lần đăng nhập thất bại CÓ return_code
+    # RC 4 = Bad username or password
+    # RC 5 = Not authorized
+    failed_logins = connect_df[
+        connect_df["return_code_num"].isin([4, 5]) &
+        connect_df["username"].notna() &
+        (connect_df["username"] != "") &
+        (connect_df["username"] != "unknown")
+    ]
+
+    if failed_logins.empty:
+        # print("[DBG] brute_force: No failed login (RC 4/5) events with username found.")
         return
 
-    # Group by source IP and count failures
-    ip_fail_counts = failed_auth_df.groupby("src_ip").size().reset_index(name="count")
+    # Đếm số lần thất bại cho mỗi username
+    failure_counts = failed_logins.groupby("username").size().reset_index(name="count")
+    print(f"[DBG] brute_force: Found failure counts: {failure_counts.to_dict('records')}")
 
-    for _, row in ip_fail_counts.iterrows():
-        if row["count"] > BRUTE_FORCE_LIMIT and row["src_ip"] != "unknown": # <-- Ngưỡng đã được giảm
-            
-            key = ("brute_force", row["src_ip"])
+    # Kiểm tra ngưỡng (BRUTE_FORCE_LIMIT = 5)
+    for _, row in failure_counts.iterrows():
+        username = row["username"]
+        count = int(row["count"])
+        
+        if count > BRUTE_FORCE_LIMIT:
+            key = ("brute_force", username)
             if should_alert(key):
-                # Get the last client_id attempted from this IP for more context
-                last_client_id = failed_auth_df[failed_auth_df["src_ip"] == row["src_ip"]]["client_id"].iloc[-1]
+                msg = (
+                    f"Brute force detected: {count} failed login attempts (RC 4/5) "
+                    f"for username '{username}' (threshold={BRUTE_FORCE_LIMIT})"
+                )
                 
-                msg = f"Brute force: {row['count']} failed auth attempts (rc=5) from IP '{row['src_ip']}'. Last client attempted: '{last_client_id}'"
+                # Lấy client_id cuối cùng của kẻ tấn công để ghi log (chính xác hơn)
+                attacker_client_id = failed_logins[failed_logins["username"] == username]["client_id"].iloc[-1]
                 
-                write_alert(write_api, "brute_force", row["src_ip"], last_client_id, msg)
-                send_email("MQTT Security Alert: Brute Force Attack", msg)
-# --- *** KẾT THÚC RULE MỚI *** ---
+                write_alert(write_api, "brute_force", attacker_client_id, msg) 
+                send_email("MQTT Security Alert: Brute Force", msg)
+                print(f"[ALERT] Rule: brute_force | Username: {username} | Failed Attempts: {count}")
+            else:
+                print(f"[DBG] brute_force: Alert for {username} skipped (cooldown).")
+
+
+
+def detect_wildcard_abuse(df, write_api):
+    """
+    (ĐÃ VIẾT LẠI)
+    Phát hiện lạm dụng wildcard.
+    Rule này giờ đây đọc trực tiếp trường 'topic' từ các sự kiện 'subscribe'.
+    """
+    # Lấy các sự kiện subscribe CÓ chứa trường 'topic' (đã được chuẩn hóa)
+    subscribe_df = df[
+        (df["mqtt_type"] == "subscribe") &
+        (df["topic"].notna())
+    ].copy()
+
+    if subscribe_df.empty:
+        return
+
+    # Tìm các topic chứa '#' hoặc '+' trực tiếp trong cột 'topic'
+    wildcard_abuse_df = subscribe_df[subscribe_df["topic"].str.contains(r"#|.*\+.*", na=False)]
+    
+    # Lặp qua các vi phạm
+    for _, row in wildcard_abuse_df.iterrows():
+        topic = row["topic"]
+        client_id = row["client_id"]
+        
+        key = ("wildcard_abuse", client_id, topic)
+        if should_alert(key):
+            msg = f"Wildcard abuse: Client {client_id} subscribed to '{topic}'"
+            write_alert(write_api, "wildcard_abuse", client_id, msg)
+            send_email("MQTT Security Alert: Wildcard Abuse", msg)
+
+def detect_unauthorized_topics(df, write_api):
+    """
+    (ĐÃ VIẾT LẠI)
+    Phát hiện truy cập topic không được phép (publish và subscribe).
+    Rule này giờ đây đọc trực tiếp trường 'topic' cho CẢ HAI sự kiện.
+    """
+    if not ALLOWED_TOPICS_REGEX:
+        return
+    
+    # Biên dịch 1 lần
+    allowed_topics_pattern = re.compile("|".join(f"({r})" for r in ALLOWED_TOPICS_REGEX))
+
+    # Lấy TẤT CẢ sự kiện (publish HOẶC subscribe) CÓ chứa trường 'topic'
+    df_with_topic = df[
+        df["mqtt_type"].isin(["publish", "subscribe"]) &
+        df["topic"].notna()
+    ].copy()
+
+    if df_with_topic.empty:
+        return
+
+    # Thêm một cột 'is_allowed' để kiểm tra regex
+    # (Vector hóa nhanh hơn là lặp)
+    df_with_topic["is_allowed"] = df_with_topic["topic"].apply(
+        lambda t: bool(allowed_topics_pattern.fullmatch(t))
+    )
+    
+    # Lọc ra những sự kiện không được phép
+    unauth_df = df_with_topic[df_with_topic["is_allowed"] == False]
+
+    # Lặp qua các vi phạm
+    for _, row in unauth_df.iterrows():
+        if row["client_id"] == "unknown": continue
+        
+        topic = row["topic"]
+        client_id = row["client_id"]
+        mqtt_type = row["mqtt_type"]
+        
+        key = ("unauth_topic", client_id, topic)
+        if should_alert(key):
+            msg = f"Unauthorized {mqtt_type}: Client {client_id} tried to access unauthorized topic '{topic}'"
+            write_alert(write_api, "unauth_topic", client_id, msg)
+            send_email("MQTT Security Alert: Unauthorized Topic", msg)
+
+def detect_topic_enumeration(df, write_api):
+    """
+    (ĐÃ VIẾT LẠI)
+    Phát hiện dò quét topic (publish và subscribe).
+    Rule này giờ đây đọc trực tiếp trường 'topic' cho CẢ HAI sự kiện.
+    """
+    # Lấy TẤT CẢ sự kiện (publish HOẶC subscribe) CÓ chứa trường 'topic'
+    all_topics_df = df[
+        df["mqtt_type"].isin(["publish", "subscribe"]) &
+        df["topic"].notna()
+    ].copy()
+
+    if all_topics_df.empty:
+        return
+    
+    # Nhóm theo client_id và đếm số topic DUY NHẤT
+    unique_topic_counts = all_topics_df.groupby("client_id")["topic"].nunique()
+    
+    for client_id, count in unique_topic_counts.items():
+        # Kiểm tra với ENUM_LIMIT (đã giảm xuống 10)
+        if count > ENUM_LIMIT and client_id != "unknown": 
+            key = ("topic_enumeration", client_id)
+            if should_alert(key):
+                msg = f"Topic enumeration: Client '{client_id}' accessed {count} unique topics"
+                write_alert(write_api, "topic_enumeration", client_id, msg)
+                send_email("MQTT Security Alert: Topic Enumeration", msg)
+
+# ===================================================================
+# === KẾT THÚC PHẦN VIẾT LẠI ===
+# ===================================================================
 
 
 def normalize_columns_safely(df):
@@ -492,8 +452,6 @@ def normalize_columns_safely(df):
     
     if "client_id" in df.columns:
         df["client_id"] = df["client_id"].fillna("unknown")
-    if "src_ip" in df.columns:
-        df["src_ip"] = df["src_ip"].fillna("unknown")
     
     return df
 
@@ -515,7 +473,8 @@ def main():
             # 1. Query data from InfluxDB
             print(f"[INFO] Querying data for the last {WINDOW_SECONDS} seconds...")
             
-            # --- *** SỬA QUERY ĐỂ THÊM 'disconnect' CHO RULE BRUTE FORCE *** ---
+            # Query này vẫn đúng vì nó lấy _measurement == "mqtt_event"
+            # và file log mới của bạn vẫn ghi vào "mqtt_event"
             query = f"""
             from(bucket: "{SRC_BUCKET}")
               |> range(start: -{WINDOW_SECONDS}s)
@@ -524,11 +483,12 @@ def main():
                   r.mqtt_type == "connect" or 
                   r.mqtt_type == "publish" or 
                   r.mqtt_type == "subscribe" or 
-                  r.mqtt_type == "disconnect"
+                  r.mqtt_type == "disconnect" or
+                  r.mqtt_type == "connack" 
               )
               |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
               |> keep(columns: [
-                  "_time", "src_ip", "src_port", "client_id", "mqtt_type", "topic", "payload_raw", 
+                  "_time", "src_ip", "src_port", "client_id", "mqtt_type", "topic", "payload_raw", "payload_len",
                   "retain", "qos", "client_identifier", "bytes_toserver", "pkts_toserver", 
                   "state", "protocol_version", "flags_clean_session", "flags_username", 
                   "flags_password", "flags_will", "flags_will_retain", "topics", 
@@ -537,6 +497,16 @@ def main():
               ])
               |> sort(columns: ["_time"], desc: false)
             """
+            
+            # (Ghi chú nhỏ: Tôi đã thêm 'connack' vào query để đảm bảo nó luôn được lấy)
+            # (Trong file gốc của bạn, 'connack' bị thiếu, nhưng có thể nó vẫn chạy 
+            # do một query khác, tuy nhiên thêm vào đây sẽ chắc chắn hơn)
+            if 'r.mqtt_type == "connack"' not in query:
+                 query = query.replace(
+                     'r.mqtt_type == "disconnect"',
+                     'r.mqtt_type == "disconnect" or r.mqtt_type == "connack"'
+                 )
+
 
             result = query_api.query_data_frame(query=query)
             
@@ -592,7 +562,7 @@ def main():
                 print(f"[RULE ERROR] reconnect_storm: {e}")
 
             try:
-                detect_wildcard_abuse(df_filtered, write_api)
+                detect_wildcard_abuse(df_filtered, write_api) # (Đã được viết lại)
             except Exception as e:
                 print(f"[RULE ERROR] wildcard_abuse: {e}")
 
@@ -602,12 +572,12 @@ def main():
                 print(f"[RULE ERROR] retain_qos_abuse: {e}")
 
             try:
-                detect_payload_anomaly(df_filtered, write_api)
+                detect_payload_flow_anomaly(df_filtered, write_api)
             except Exception as e:
                 print(f"[RULE ERROR] payload_anomaly: {e}")
 
             try:
-                detect_unauthorized_topics(df_filtered, write_api)
+                detect_unauthorized_topics(df_filtered, write_api) # (Đã được viết lại)
             except Exception as e:
                 print(f"[RULE ERROR] unauthorized_topics: {e}")
 
@@ -617,7 +587,7 @@ def main():
                 print(f"[RULE ERROR] publish_flood: {e}")
                 
             try:
-                detect_topic_enumeration(df_filtered, write_api)
+                detect_topic_enumeration(df_filtered, write_api) # (Đã được viết lại)
             except Exception as e:
                 print(f"[RULE ERROR] topic_enumeration: {e}")
             
@@ -626,12 +596,10 @@ def main():
             except Exception as e:
                 print(f"[RULE ERROR] suspicious_client_id: {e}")
 
-            # --- *** THÊM LỆNH GỌI RULE MỚI *** ---
             try:
-                detect_brute_force(df_filtered, write_api)
+                detect_brute_force(df_filtered, write_api) # (ĐÃ SỬA)
             except Exception as e:
                 print(f"[RULE ERROR] brute_force: {e}")
-            # --- *** KẾT THÚC *** ---
 
         except Exception as e:
             print(f"[ERROR] Query/Detect: {e}")
